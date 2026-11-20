@@ -2239,6 +2239,29 @@ class MooncakeDistributedNoFRegisterPyWrapper {
 };
 
 PYBIND11_MODULE(_store, m) {
+    py::class_<AsyncMemoryBatchGet, std::shared_ptr<AsyncMemoryBatchGet>>(
+        m, "AsyncMemoryBatchGet")
+        .def("ready", &AsyncMemoryBatchGet::ready,
+             "True when all submissions have reached terminal status.")
+        .def("wait", [](AsyncMemoryBatchGet& op) {
+            py::gil_scoped_release release;
+            return op.wait();
+        }, "Wait for transfer drain; returns per-key bytes or negative errors.")
+        .def("poll", [](AsyncMemoryBatchGet& op) -> py::object {
+            bool done;
+            {
+                py::gil_scoped_release release;
+                done = op.ready();
+            }
+            if (!done) return py::none();
+            std::vector<int64_t> values;
+            {
+                py::gil_scoped_release release;
+                values = op.wait();
+            }
+            return py::cast(values);
+        }, "Nonblocking completion check (None until complete).");
+
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");
@@ -3448,6 +3471,25 @@ PYBIND11_MODULE(_store, m) {
             "Put object data directly from multiple pre-allocated buffers for "
             "multiple "
             "keys")
+        .def(
+            "batch_get_into_multi_buffers_async",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string>& keys,
+               const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs,
+               const std::vector<std::vector<size_t>>& all_sizes) {
+                auto real = std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real || !self.is_client_initialized()) {
+                    throw py::value_error(
+                        "async batch get requires an initialized RealClient");
+                }
+                py::gil_scoped_release release;
+                return real->submit_async_memory_batch_get(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"),
+            py::arg("all_sizes"),
+            "Submit direct RDMA memory-only batch read. Keep registered "
+            "destinations alive until operation.wait() finishes.")
         .def(
             "batch_get_into_multi_buffers",
             [](MooncakeStorePyWrapper &self,
