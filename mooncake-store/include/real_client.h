@@ -1382,6 +1382,11 @@ class RealClient : public PyClient {
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
+    // Serializes async admissions against deregistration and teardown.
+    // The manager tracks registered destination reservations until completion.
+    std::mutex async_memory_get_mutex_;
+    std::shared_ptr<AsyncMemoryGetManager> async_memory_get_manager_;
+
     std::mutex teardown_mutex_;
     ErrorCode storage_shutdown_error_ = ErrorCode::OK;
     RpcDrainGuard offload_rpc_drain_;
