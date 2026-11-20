@@ -1,4 +1,6 @@
 #include "client_service.h"
+#include <stdexcept>
+#include <cstdint>
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -1360,6 +1362,125 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     return client;
+}
+
+
+AsyncMemoryBatchGet::AsyncMemoryBatchGet(
+    std::shared_ptr<Client> owner, std::vector<Entry> entries)
+    : owner_(std::move(owner)), entries_(std::move(entries)) {}
+
+AsyncMemoryBatchGet::~AsyncMemoryBatchGet() {
+    // A dropped Python/C++ handle must not release the Client/TE while
+    // in-flight DMA may still write into caller destinations.
+    (void)wait();
+}
+
+bool AsyncMemoryBatchGet::ready() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (completed_) return true;
+    for (auto& entry : entries_) {
+        if (entry.transfer && !entry.transfer->isReady()) return false;
+    }
+    // isReady() is only a hint; wait() is the terminal DMA-drain boundary.
+    return true;
+}
+
+std::vector<int64_t> AsyncMemoryBatchGet::wait() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (completed_) return *completed_;
+    std::vector<int64_t> values;
+    values.reserve(entries_.size());
+    for (auto& entry : entries_) {
+        if (entry.transfer) {
+            const ErrorCode status = entry.transfer->get();
+            entry.transfer.reset();
+            if (status != ErrorCode::OK) {
+                entry.result = static_cast<int64_t>(status);
+            } else {
+                auto check = owner_->VerifyObjectChecksum(
+                    entry.key, entry.slices, entry.bytes,
+                    entry.query->object_checksum);
+                if (!check) {
+                    entry.result = static_cast<int64_t>(check.error());
+                } else if (entry.query->IsLeaseExpired()) {
+                    entry.result =
+                        static_cast<int64_t>(ErrorCode::LEASE_EXPIRED);
+                } else {
+                    entry.result = static_cast<int64_t>(entry.bytes);
+                }
+            }
+        }
+        values.push_back(entry.result);
+    }
+    completed_ = values;
+    return values;
+}
+
+std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
+    std::shared_ptr<Client> owner,
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<Slice>>& destinations) {
+    if (owner.get() != this || keys.size() != destinations.size() ||
+        !transfer_submitter_ || protocol_ != "rdma") {
+        throw std::invalid_argument("async memory batch get requires RDMA and "
+                                    "matching keys/destinations");
+    }
+
+    std::unordered_set<std::string> seen;
+    std::vector<AsyncMemoryBatchGet::Entry> entries;
+    entries.reserve(keys.size());
+    const auto queries = BatchQuery(keys);
+    if (queries.size() != keys.size()) {
+        throw std::runtime_error("async batch read metadata count mismatch");
+    }
+    auto select = MakeReadReplicaSelector();
+
+    // Preflight every key and replica before starting ANY transfer. This
+    // prevents an unsupported SSD/DFS/NoF route from partially writing memory.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!seen.insert(keys[i]).second || destinations[i].empty() ||
+            !queries[i]) {
+            throw std::invalid_argument("async batch read invalid/duplicate "
+                                        "key or metadata lookup failure");
+        }
+        AsyncMemoryBatchGet::Entry entry;
+        entry.key = keys[i];
+        entry.slices = destinations[i];
+        for (const Slice& slice : entry.slices) {
+            if (!slice.ptr || slice.size > SIZE_MAX - entry.bytes) {
+                throw std::invalid_argument("async batch read invalid slice");
+            }
+            entry.bytes += slice.size;
+        }
+        const auto& query = queries[i].value();
+        if (query.IsLeaseExpired()) {
+            throw std::runtime_error("async batch read lease expired");
+        }
+        const auto error =
+            select(query.replicas, entry.slices, entry.replica);
+        if (error != ErrorCode::OK || !entry.replica.is_memory_replica()) {
+            throw std::invalid_argument(
+                "async batch get only supports memory-backed replicas");
+        }
+        if (entry.bytes != calculate_total_size(entry.replica)) {
+            throw std::invalid_argument("async batch read size mismatch");
+        }
+        entry.query.emplace(query);
+        entries.emplace_back(std::move(entry));
+    }
+
+    for (auto& entry : entries) {
+        auto submitted = SubmitSingleTransfer(
+            entry.replica, entry.slices, TransferRequest::READ,
+            TransferIntent::kForegroundGet);
+        if (submitted) {
+            entry.transfer.emplace(std::move(submitted.value()));
+        } else {
+            entry.result = static_cast<int64_t>(submitted.error());
+        }
+    }
+    return std::make_shared<AsyncMemoryBatchGet>(std::move(owner),
+                                                  std::move(entries));
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
