@@ -1599,7 +1599,15 @@ void AsyncMemoryGetManager::RunCompletions() {
         std::shared_ptr<AsyncMemoryBatchGet> operation;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::milliseconds(1));
+            // Sleep without polling while no backend is submitted. Pending
+            // metadata requests are handled by the submission thread.
+            cv_.wait(lock, [this] {
+                return (stopping_ && active_.empty() && queue_.empty()) ||
+                       std::any_of(active_.begin(), active_.end(),
+                                   [](const Active& item) {
+                                       return item.backend != nullptr;
+                                   });
+            });
             if (stopping_ && active_.empty() && queue_.empty()) return;
             for (auto& active : active_) {
                 if (active.backend && active.backend->ready()) {
@@ -1611,7 +1619,13 @@ void AsyncMemoryGetManager::RunCompletions() {
                 }
             }
         }
-        if (!backend) continue;
+        if (!backend) {
+            // One bounded poll interval only when a real transfer is active.
+            // Avoid spinning when a submitter is still resolving metadata.
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait_for(lock, std::chrono::milliseconds(1));
+            continue;
+        }
         std::vector<int64_t> results;
         try {
             results = backend->wait();
