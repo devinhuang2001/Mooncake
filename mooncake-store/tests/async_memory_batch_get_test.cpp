@@ -30,11 +30,11 @@ TEST(AsyncMemoryBatchGetTest, TerminalPerKeyErrorsRemainAligned) {
     second.result = static_cast<int64_t>(ErrorCode::TRANSFER_FAIL);
     entries.emplace_back(std::move(second));
 
-    auto op = std::make_shared<AsyncMemoryBatchGet>(nullptr,
-                                                    std::move(entries));
-    const auto expected = std::vector<int64_t>{
-        static_cast<int64_t>(ErrorCode::OBJECT_NOT_FOUND),
-        static_cast<int64_t>(ErrorCode::TRANSFER_FAIL)};
+    auto op =
+        std::make_shared<AsyncMemoryBatchGet>(nullptr, std::move(entries));
+    const auto expected =
+        std::vector<int64_t>{static_cast<int64_t>(ErrorCode::OBJECT_NOT_FOUND),
+                             static_cast<int64_t>(ErrorCode::TRANSFER_FAIL)};
     EXPECT_TRUE(op->ready());
     EXPECT_EQ(op->wait(), expected);
     EXPECT_EQ(op->wait(), expected);
