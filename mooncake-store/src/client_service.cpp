@@ -1486,7 +1486,17 @@ AsyncMemoryGetManager::AsyncMemoryGetManager(
         };
     }
     submission_thread_ = std::thread([this] { RunSubmissions(); });
-    completion_thread_ = std::thread([this] { RunCompletions(); });
+    try {
+        completion_thread_ = std::thread([this] { RunCompletions(); });
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        submission_thread_.join();
+        throw;
+    }
 }
 
 AsyncMemoryGetManager::~AsyncMemoryGetManager() { CloseAndDrain(); }
@@ -1693,10 +1703,9 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
 
     // All-key preflight before the first DMA submission.
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (!seen.insert(keys[i]).second || destinations[i].empty() ||
-            !queries[i]) {
+        if (!seen.insert(keys[i]).second || destinations[i].empty()) {
             throw std::invalid_argument(
-                "async get invalid/duplicate key or missing metadata");
+                "async get requires unique keys and valid destination slices");
         }
         AsyncMemoryBatchGet::Entry entry;
         entry.key = keys[i];
@@ -1708,9 +1717,18 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
             }
             entry.bytes += slice.size;
         }
+        if (!queries[i]) {
+            // A cache miss is a key-level failure, not a malformed operation.
+            // Preserve the input index while other memory replicas advance.
+            entry.result = static_cast<int64_t>(queries[i].error());
+            entries.emplace_back(std::move(entry));
+            continue;
+        }
         const auto& query = queries[i].value();
         if (query.IsLeaseExpired()) {
-            throw std::runtime_error("async batch read lease expired");
+            entry.result = static_cast<int64_t>(ErrorCode::LEASE_EXPIRED);
+            entries.emplace_back(std::move(entry));
+            continue;
         }
         const ErrorCode error =
             select(query.replicas, entry.slices, entry.replica);
@@ -1733,6 +1751,7 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
         std::make_shared<AsyncMemoryBatchGet>(std::move(owner),
                                                std::move(entries));
     for (auto& entry : backend->entries_) {
+        if (!entry.query) continue;
         auto submitted = SubmitSingleTransfer(
             entry.replica, entry.slices, TransferRequest::READ,
             TransferIntent::kForegroundGet);
