@@ -8682,9 +8682,9 @@ RealClient::batch_put_from_multi_buffers_internal(
 }
 
 std::shared_ptr<AsyncMemoryBatchGet> RealClient::submit_async_memory_batch_get(
-    const std::vector<std::string>& keys,
-    const std::vector<std::vector<void*>>& all_buffers,
-    const std::vector<std::vector<size_t>>& all_sizes) {
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes) {
     if (!client_ || client_->GetProtocol() != "rdma" ||
         keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         throw std::invalid_argument(
@@ -8708,13 +8708,11 @@ std::shared_ptr<AsyncMemoryBatchGet> RealClient::submit_async_memory_batch_get(
                 throw std::invalid_argument(
                     "async get requires a registered writable buffer");
             }
-            slices.emplace_back(
-                Slice{all_buffers[i][j], all_sizes[i][j]});
+            slices.emplace_back(Slice{all_buffers[i][j], all_sizes[i][j]});
         }
         destinations.emplace_back(std::move(slices));
     }
-    return client_->SubmitAsyncMemoryBatchGet(
-        client_, keys, destinations);
+    return client_->SubmitAsyncMemoryBatchGet(client_, keys, destinations);
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
