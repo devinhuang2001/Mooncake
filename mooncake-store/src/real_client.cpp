@@ -1930,6 +1930,13 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     std::lock_guard teardown_lock(teardown_mutex_);
     // Serialize complete cleanup, including retries after a failed unregister.
     closed_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> guard(async_memory_get_mutex_);
+        if (async_memory_get_manager_) {
+            async_memory_get_manager_->CloseAndDrain();
+            async_memory_get_manager_.reset();
+        }
+    }
     // Stop new offload work before draining any pool it can submit to.
     while (!offload_rpc_drain_.drain_for(std::chrono::seconds(30))) {
         LOG(WARNING) << "Waiting for in-flight offload RPCs during teardown";
@@ -4890,6 +4897,10 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
 }
 
 int RealClient::unregister_buffer(void *buffer) {
+    // Drain accepted DMA before removing a memory registration. Hold the
+    // admission mutex until the unregister call has finished.
+    std::lock_guard<std::mutex> guard(async_memory_get_mutex_);
+    if (async_memory_get_manager_) async_memory_get_manager_->Drain();
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
@@ -8685,10 +8696,14 @@ std::shared_ptr<AsyncMemoryBatchGet> RealClient::submit_async_memory_batch_get(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes) {
-    if (!client_ || client_->GetProtocol() != "rdma" ||
+    // Keep this lock through validation AND reservation. Unregister and
+    // shutdown take the same lock, so neither can race an accepted read.
+    std::lock_guard<std::mutex> guard(async_memory_get_mutex_);
+    if (closed_.load(std::memory_order_acquire) || !client_ ||
+        client_->GetProtocol() != "rdma" ||
         keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         throw std::invalid_argument(
-            "asynchronous batch-get requires an initialized RDMA Store");
+            "asynchronous batch-get requires an active RDMA Store");
     }
     std::vector<std::vector<Slice>> destinations;
     destinations.reserve(keys.size());
@@ -8712,7 +8727,13 @@ std::shared_ptr<AsyncMemoryBatchGet> RealClient::submit_async_memory_batch_get(
         }
         destinations.emplace_back(std::move(slices));
     }
-    return client_->SubmitAsyncMemoryBatchGet(client_, keys, destinations);
+    if (!async_memory_get_manager_) {
+        constexpr size_t kMaxAsyncReads = 16;
+        constexpr size_t kMaxAsyncReadBytes = 256ULL * 1024 * 1024;
+        async_memory_get_manager_ = std::make_shared<AsyncMemoryGetManager>(
+            client_, kMaxAsyncReads, kMaxAsyncReadBytes);
+    }
+    return async_memory_get_manager_->Submit(keys, destinations);
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
