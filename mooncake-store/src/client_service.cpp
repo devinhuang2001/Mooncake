@@ -1364,9 +1364,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     return client;
 }
 
-
-AsyncMemoryBatchGet::AsyncMemoryBatchGet(
-    std::shared_ptr<Client> owner, std::vector<Entry> entries)
+AsyncMemoryBatchGet::AsyncMemoryBatchGet(std::shared_ptr<Client> owner,
+                                         std::vector<Entry> entries)
     : owner_(std::move(owner)), entries_(std::move(entries)) {}
 
 AsyncMemoryBatchGet::~AsyncMemoryBatchGet() {
@@ -1417,13 +1416,13 @@ std::vector<int64_t> AsyncMemoryBatchGet::wait() {
 }
 
 std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
-    std::shared_ptr<Client> owner,
-    const std::vector<std::string>& keys,
+    std::shared_ptr<Client> owner, const std::vector<std::string>& keys,
     const std::vector<std::vector<Slice>>& destinations) {
     if (owner.get() != this || keys.size() != destinations.size() ||
         !transfer_submitter_ || protocol_ != "rdma") {
-        throw std::invalid_argument("async memory batch get requires RDMA and "
-                                    "matching keys/destinations");
+        throw std::invalid_argument(
+            "async memory batch get requires RDMA and "
+            "matching keys/destinations");
     }
 
     std::unordered_set<std::string> seen;
@@ -1440,8 +1439,9 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
     for (size_t i = 0; i < keys.size(); ++i) {
         if (!seen.insert(keys[i]).second || destinations[i].empty() ||
             !queries[i]) {
-            throw std::invalid_argument("async batch read invalid/duplicate "
-                                        "key or metadata lookup failure");
+            throw std::invalid_argument(
+                "async batch read invalid/duplicate "
+                "key or metadata lookup failure");
         }
         AsyncMemoryBatchGet::Entry entry;
         entry.key = keys[i];
@@ -1456,8 +1456,7 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
         if (query.IsLeaseExpired()) {
             throw std::runtime_error("async batch read lease expired");
         }
-        const auto error =
-            select(query.replicas, entry.slices, entry.replica);
+        const auto error = select(query.replicas, entry.slices, entry.replica);
         if (error != ErrorCode::OK || !entry.replica.is_memory_replica()) {
             throw std::invalid_argument(
                 "async batch get only supports memory-backed replicas");
@@ -1470,9 +1469,9 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
     }
 
     for (auto& entry : entries) {
-        auto submitted = SubmitSingleTransfer(
-            entry.replica, entry.slices, TransferRequest::READ,
-            TransferIntent::kForegroundGet);
+        auto submitted = SubmitSingleTransfer(entry.replica, entry.slices,
+                                              TransferRequest::READ,
+                                              TransferIntent::kForegroundGet);
         if (submitted) {
             entry.transfer.emplace(std::move(submitted.value()));
         } else {
@@ -1480,7 +1479,7 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
         }
     }
     return std::make_shared<AsyncMemoryBatchGet>(std::move(owner),
-                                                  std::move(entries));
+                                                 std::move(entries));
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
