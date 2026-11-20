@@ -1,24 +1,78 @@
 #include <gtest/gtest.h>
 
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "client_service.h"
 
 namespace mooncake {
+
+// Test-only completion hook: no transport hardware is needed to control
+// completion ordering, timeout, and the Store dispatcher state machine.
+class AsyncMemoryBatchGetTestPeer {
+   public:
+    static void Complete(const std::shared_ptr<AsyncMemoryBatchGet>& op,
+                         std::vector<int64_t> results) {
+        op->Complete(std::move(results));
+    }
+};
+
 namespace {
 
-TEST(AsyncMemoryBatchGetTest, EmptyOperationIsImmediatelyComplete) {
-    // This unit test does not need RDMA or a Store Master. Data-plane
-    // integration tests exercise actual transfers on RDMA hardware.
+using namespace std::chrono_literals;
+
+class FakeBackend {
+   public:
+    std::shared_ptr<AsyncMemoryBatchGet> Submit(
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<Slice>>&) {
+        auto backend =
+            std::make_shared<AsyncMemoryBatchGet>(nullptr, keys.size());
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            backends_.push_back(backend);
+        }
+        cv_.notify_all();
+        return backend;
+    }
+
+    std::shared_ptr<AsyncMemoryBatchGet> WaitForSubmission(size_t index) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_for(lock, 3s, [this, index] {
+                return backends_.size() > index;
+            })) {
+            return nullptr;
+        }
+        return backends_[index];
+    }
+
+    size_t SubmissionCount() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return backends_.size();
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<std::shared_ptr<AsyncMemoryBatchGet>> backends_;
+};
+
+TEST(AsyncMemoryBatchGetTest, EmptyBackendOperationCompletes) {
     auto op = std::make_shared<AsyncMemoryBatchGet>(
         nullptr, std::vector<AsyncMemoryBatchGet::Entry>{});
     EXPECT_TRUE(op->ready());
     EXPECT_TRUE(op->wait().empty());
-    EXPECT_TRUE(op->ready());
+    EXPECT_TRUE(op->wait().empty());
 }
 
-TEST(AsyncMemoryBatchGetTest, TerminalPerKeyErrorsRemainAligned) {
+TEST(AsyncMemoryBatchGetTest, TerminalErrorsKeepInputOrdering) {
     std::vector<AsyncMemoryBatchGet::Entry> entries;
     AsyncMemoryBatchGet::Entry first;
     first.key = "missing";
@@ -32,12 +86,141 @@ TEST(AsyncMemoryBatchGetTest, TerminalPerKeyErrorsRemainAligned) {
 
     auto op =
         std::make_shared<AsyncMemoryBatchGet>(nullptr, std::move(entries));
-    const auto expected =
-        std::vector<int64_t>{static_cast<int64_t>(ErrorCode::OBJECT_NOT_FOUND),
-                             static_cast<int64_t>(ErrorCode::TRANSFER_FAIL)};
+    const std::vector<int64_t> expected = {
+        static_cast<int64_t>(ErrorCode::OBJECT_NOT_FOUND),
+        static_cast<int64_t>(ErrorCode::TRANSFER_FAIL)};
     EXPECT_TRUE(op->ready());
     EXPECT_EQ(op->wait(), expected);
     EXPECT_EQ(op->wait(), expected);
+}
+
+TEST(AsyncMemoryBatchGetTest, TimeoutDoesNotCompleteOperation) {
+    auto op = std::make_shared<AsyncMemoryBatchGet>(nullptr, 2);
+    EXPECT_FALSE(op->ready());
+    EXPECT_FALSE(op->wait_for(0ms).has_value());
+    EXPECT_FALSE(op->wait_for(3ms).has_value());
+    AsyncMemoryBatchGetTestPeer::Complete(op, {11, 17});
+    EXPECT_TRUE(op->ready());
+    EXPECT_EQ(op->wait_for(0ms), (std::vector<int64_t>{11, 17}));
+    EXPECT_EQ(op->wait(), (std::vector<int64_t>{11, 17}));
+    EXPECT_THROW(op->wait_for(-1ms), std::invalid_argument);
+}
+
+TEST(AsyncMemoryBatchGetTest, IndependentSubmissionAndOutOfOrderCompletion) {
+    FakeBackend backend;
+    AsyncMemoryGetManager manager(
+        nullptr, 2, 32,
+        [&backend](const auto& keys, const auto& destinations) {
+            return backend.Submit(keys, destinations);
+        });
+    std::array<char, 16> first{};
+    std::array<char, 16> second{};
+    auto l0 = manager.Submit({"L0"}, {{{first.data(), first.size()}}});
+    ASSERT_NE(backend.WaitForSubmission(0), nullptr);
+    // L0 has not completed, yet the one submission thread must reach L1.
+    auto l1 = manager.Submit({"L1"}, {{{second.data(), second.size()}}});
+    auto second_backend = backend.WaitForSubmission(1);
+    ASSERT_NE(second_backend, nullptr);
+    EXPECT_FALSE(l0->ready());
+    EXPECT_FALSE(l1->ready());
+    AsyncMemoryBatchGetTestPeer::Complete(second_backend, {16});
+    ASSERT_TRUE(l1->wait_for(3s).has_value());
+    EXPECT_EQ(l1->wait(), (std::vector<int64_t>{16}));
+    EXPECT_FALSE(l0->wait_for(0ms).has_value());
+    AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(0), {16});
+    EXPECT_EQ(l0->wait(), (std::vector<int64_t>{16}));
+    manager.Drain();
+    EXPECT_EQ(manager.InFlight(), (std::pair<size_t, size_t>{0, 0}));
+}
+
+TEST(AsyncMemoryBatchGetTest, OperationAndByteBudgetsBoundSubmission) {
+    FakeBackend backend;
+    AsyncMemoryGetManager manager(
+        nullptr, 1, 8,
+        [&backend](const auto& keys, const auto& destinations) {
+            return backend.Submit(keys, destinations);
+        });
+    std::array<char, 8> memory{};
+    auto first = manager.Submit({"one"}, {{{memory.data(), 8}}});
+    ASSERT_NE(backend.WaitForSubmission(0), nullptr);
+    EXPECT_THROW(manager.Submit({"two"}, {{{memory.data(), 8}}}),
+                 std::runtime_error);
+    EXPECT_THROW(manager.Submit({"too-large"}, {{{memory.data(), 9}}}),
+                 std::invalid_argument);
+    EXPECT_EQ(backend.SubmissionCount(), 1U);
+    EXPECT_EQ(manager.InFlight(), (std::pair<size_t, size_t>{1, 8}));
+    AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(0), {8});
+    EXPECT_EQ(first->wait(), (std::vector<int64_t>{8}));
+    manager.Drain();
+    auto second = manager.Submit({"two"}, {{{memory.data(), 8}}});
+    ASSERT_NE(backend.WaitForSubmission(1), nullptr);
+    AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(1), {8});
+    EXPECT_EQ(second->wait(), (std::vector<int64_t>{8}));
+    manager.Drain();
+}
+
+TEST(AsyncMemoryBatchGetTest, RejectsOverlapsAndMalformedDescriptors) {
+    FakeBackend backend;
+    AsyncMemoryGetManager manager(
+        nullptr, 3, 64,
+        [&backend](const auto& keys, const auto& destinations) {
+            return backend.Submit(keys, destinations);
+        });
+    std::array<char, 32> memory{};
+    EXPECT_THROW(manager.Submit({}, {}), std::invalid_argument);
+    EXPECT_THROW(manager.Submit({"dup", "dup"}, {
+                     {{memory.data(), 8}},
+                     {{memory.data() + 16, 8}}}),
+                 std::invalid_argument);
+    EXPECT_THROW(manager.Submit({"self"}, {
+                     {{memory.data(), 8}, {memory.data() + 4, 8}}}),
+                 std::invalid_argument);
+    EXPECT_THROW(manager.Submit({"null"}, {{{nullptr, 8}}}),
+                 std::invalid_argument);
+    EXPECT_THROW(manager.Submit({"empty"}, {{{memory.data(), 0}}}),
+                 std::invalid_argument);
+    EXPECT_EQ(backend.SubmissionCount(), 0U);
+
+    auto first = manager.Submit({"one"}, {{{memory.data(), 8}}});
+    ASSERT_NE(backend.WaitForSubmission(0), nullptr);
+    EXPECT_THROW(manager.Submit({"overlap"}, {{{memory.data() + 4, 8}}}),
+                 std::invalid_argument);
+    EXPECT_EQ(backend.SubmissionCount(), 1U);
+    AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(0), {8});
+    EXPECT_EQ(first->wait(), (std::vector<int64_t>{8}));
+    manager.Drain();
+    auto next = manager.Submit({"after-drain"}, {
+        {{memory.data() + 4, 8}}});
+    ASSERT_NE(backend.WaitForSubmission(1), nullptr);
+    AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(1), {8});
+    EXPECT_EQ(next->wait(), (std::vector<int64_t>{8}));
+    manager.Drain();
+}
+
+TEST(AsyncMemoryBatchGetTest, ShutdownDrainsAndRejectsAdmissions) {
+    FakeBackend backend;
+    AsyncMemoryGetManager manager(
+        nullptr, 1, 8,
+        [&backend](const auto& keys, const auto& destinations) {
+            return backend.Submit(keys, destinations);
+        });
+    std::array<char, 8> memory{};
+    auto op = manager.Submit({"one"}, {{{memory.data(), 8}}});
+    ASSERT_NE(backend.WaitForSubmission(0), nullptr);
+    std::atomic<bool> close_returned{false};
+    std::thread closer([&] {
+        manager.CloseAndDrain();
+        close_returned.store(true, std::memory_order_release);
+    });
+    EXPECT_FALSE(op->wait_for(10ms).has_value());
+    EXPECT_FALSE(close_returned.load(std::memory_order_acquire));
+    AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(0), {8});
+    closer.join();
+    EXPECT_TRUE(close_returned.load(std::memory_order_acquire));
+    EXPECT_EQ(op->wait(), (std::vector<int64_t>{8}));
+    EXPECT_THROW(manager.Submit({"after-close"}, {
+                     {{memory.data(), 8}}}),
+                 std::runtime_error);
 }
 
 }  // namespace
