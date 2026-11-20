@@ -204,9 +204,9 @@ class RealClient : public PyClient {
     // First-phase RFC #5668 API: RDMA memory-backed reads into explicitly
     // registered buffers only. Returned handle keeps the Store Client alive.
     std::shared_ptr<AsyncMemoryBatchGet> submit_async_memory_batch_get(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes);
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
