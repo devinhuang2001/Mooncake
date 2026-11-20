@@ -1,0 +1,83 @@
+name: Soft-RoCE RDMA smoke (Mooncake RFC 5668)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/pr5716-soft-roce-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  soft-roce:
+    name: RXE verbs / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - name: Inspect runner and install RDMA tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          id
+          ip -br link
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y rdma-core ibverbs-utils ibverbs-providers perftest iproute2 kmod
+          test -d /lib/modules/"$(uname -r)"
+          find /lib/modules/"$(uname -r)" -iname '*rxe*' -o -iname '*ib_core*' | head -30 || true
+
+      - name: Load Soft-RoCE module and create RXE device
+        shell: bash
+        run: |
+          set -euxo pipefail
+          KERNEL="$(uname -r)"
+          if ! sudo modprobe rdma_rxe; then
+            echo "Trying matching linux-modules-extra for ${KERNEL}"
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-modules-extra-${KERNEL}" || true
+            sudo modprobe rdma_rxe
+          fi
+          IFACE="$(ip -4 route show default | awk '{print $5; exit}')"
+          test -n "${IFACE}"
+          IP="$(ip -4 -o addr show dev "${IFACE}" | awk '{print $4; exit}' | cut -d/ -f1)"
+          test -n "${IP}"
+          echo "RXE_NETDEV=${IFACE}" >> "$GITHUB_ENV"
+          echo "RXE_IP=${IP}" >> "$GITHUB_ENV"
+          sudo rdma link add rxe0 type rxe netdev "${IFACE}"
+          rdma link show
+          ibv_devices
+          ibv_devinfo -d rxe0
+          test -d /sys/class/infiniband/rxe0
+
+      - name: Run actual RDMA READ through RXE on the runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for gid in 0 1 2 3; do
+            echo "::group::RDMA READ GID index ${gid}"
+            timeout 40s ib_read_bw -d rxe0 -i 1 -x "${gid}" -s 65536 -n 100 -p 18515 --report_gbits > /tmp/rxe-server.log 2>&1 &
+            server_pid=$!
+            sleep 2
+            set +e
+            timeout 30s ib_read_bw -d rxe0 -i 1 -x "${gid}" -s 65536 -n 100 -p 18515 --report_gbits "${RXE_IP}" > /tmp/rxe-client.log 2>&1
+            client_rc=$?
+            wait "${server_pid}"
+            server_rc=$?
+            set -e
+            echo "Server result (rc=${server_rc}):"
+            cat /tmp/rxe-server.log
+            echo "Client result (rc=${client_rc}):"
+            cat /tmp/rxe-client.log
+            echo "::endgroup::"
+            if [[ "${client_rc}" == 0 && "${server_rc}" == 0 ]]; then ok=1; break; fi
+          done
+          if [[ "${ok}" != 1 ]]; then
+            echo "::error::No successful Soft-RoCE RDMA READ; do not claim data-plane verification"
+            exit 1
+          fi
+          echo "RDMA READ completed successfully using Soft-RoCE (software transport, NOT hardware RDMA)."
