@@ -1,6 +1,13 @@
 name: Async Store CPU Test (RFC 5668)
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - mooncake-store/**
+      - mooncake-integration/store/store_py.cpp
+      - .github/workflows/async-store-cpu-rfc5668.yml
   push:
     branches:
       - work/async-store-batch-get-rfc5668
