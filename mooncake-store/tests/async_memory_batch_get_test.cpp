@@ -223,5 +223,69 @@ TEST(AsyncMemoryBatchGetTest, ShutdownDrainsAndRejectsAdmissions) {
                  std::runtime_error);
 }
 
+TEST(AsyncMemoryBatchGetTest, FailedSubmissionReleasesCredits) {
+    AsyncMemoryGetManager manager(
+        nullptr, 1, 8,
+        [](const auto&, const auto&)
+            -> std::shared_ptr<AsyncMemoryBatchGet> {
+            throw std::runtime_error("injected metadata failure");
+        });
+    std::array<char, 8> buffer{};
+    auto operation =
+        manager.Submit({"broken"}, {{{buffer.data(), buffer.size()}}});
+    auto results = operation->wait_for(3s);
+    ASSERT_TRUE(results.has_value());
+    EXPECT_EQ(*results, (std::vector<int64_t>{
+                            static_cast<int64_t>(ErrorCode::TRANSFER_FAIL)}));
+    manager.Drain();
+    EXPECT_EQ(manager.InFlight(), (std::pair<size_t, size_t>{0, 0}));
+    auto retry = manager.Submit({"retry"}, {{{buffer.data(), buffer.size()}}});
+    EXPECT_TRUE(retry->wait_for(3s).has_value());
+    manager.Drain();
+}
+
+TEST(AsyncMemoryBatchGetTest, ByteBudgetIsIndependentOfOperationCount) {
+    FakeBackend backend;
+    AsyncMemoryGetManager manager(
+        nullptr, 3, 8,
+        [&backend](const auto& keys, const auto& destinations) {
+            return backend.Submit(keys, destinations);
+        });
+    std::array<char, 16> data{};
+    auto first = manager.Submit({"six"}, {{{data.data(), 6}}});
+    ASSERT_NE(backend.WaitForSubmission(0), nullptr);
+    EXPECT_THROW(manager.Submit({"three"}, {{{data.data() + 8, 3}}}),
+                 std::runtime_error);
+    EXPECT_EQ(backend.SubmissionCount(), 1U);
+    AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(0), {6});
+    EXPECT_EQ(first->wait(), (std::vector<int64_t>{6}));
+    manager.Drain();
+    auto second = manager.Submit({"three"}, {{{data.data() + 8, 3}}});
+    ASSERT_NE(backend.WaitForSubmission(1), nullptr);
+    AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(1), {3});
+    EXPECT_EQ(second->wait(), (std::vector<int64_t>{3}));
+    manager.Drain();
+}
+
+TEST(AsyncMemoryBatchGetTest, DroppedHandleRemainsOwnedThroughCompletion) {
+    FakeBackend backend;
+    AsyncMemoryGetManager manager(
+        nullptr, 1, 8,
+        [&backend](const auto& keys, const auto& destinations) {
+            return backend.Submit(keys, destinations);
+        });
+    std::array<char, 8> data{};
+    std::weak_ptr<AsyncMemoryBatchGet> dropped;
+    {
+        auto op = manager.Submit({"one"}, {{{data.data(), data.size()}}});
+        dropped = op;
+    }
+    ASSERT_NE(backend.WaitForSubmission(0), nullptr);
+    EXPECT_FALSE(dropped.expired());
+    AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(0), {8});
+    manager.CloseAndDrain();
+    EXPECT_TRUE(dropped.expired());
+}
+
 }  // namespace
 }  // namespace mooncake
