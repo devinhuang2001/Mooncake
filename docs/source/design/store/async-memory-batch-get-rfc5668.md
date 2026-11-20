@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Async memory-only batch get (RFC #5668): implementation slice
 
 This is an **experimental, incomplete** first slice of
