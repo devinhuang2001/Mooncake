@@ -73,6 +73,39 @@ class QueryResult {
     }
 };
 
+class Client;
+
+// Phase 1 of RFC #5668: one memory-only operation, owning its in-flight
+// transfers and metadata until their completion. Destinations are borrowed:
+// their registered allocations must stay alive until wait() returns.
+class AsyncMemoryBatchGet {
+   public:
+    struct Entry {
+        std::string key;
+        std::vector<Slice> slices;
+        std::optional<QueryResult> query;
+        Replica::Descriptor replica;
+        std::optional<TransferFuture> transfer;
+        size_t bytes = 0;
+        int64_t result = static_cast<int64_t>(ErrorCode::INVALID_PARAMS);
+    };
+
+    AsyncMemoryBatchGet(std::shared_ptr<Client> owner, std::vector<Entry> entries);
+    ~AsyncMemoryBatchGet();
+
+    AsyncMemoryBatchGet(const AsyncMemoryBatchGet&) = delete;
+    AsyncMemoryBatchGet& operator=(const AsyncMemoryBatchGet&) = delete;
+
+    bool ready();
+    std::vector<int64_t> wait();
+
+   private:
+    std::shared_ptr<Client> owner_;
+    std::vector<Entry> entries_;
+    std::mutex mutex_;
+    std::optional<std::vector<int64_t>> completed_;
+};
+
 /**
  * @brief Client for interacting with the mooncake distributed object store
  */
@@ -159,6 +192,14 @@ class Client {
      */
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       std::vector<Slice>& slices);
+
+    // Memory-backed RDMA only. Queries and transfer submissions happen before
+    // return; completion does not. The returned operation holds Client alive.
+    // Unsupported replica paths fail before any transfer is submitted.
+    std::shared_ptr<AsyncMemoryBatchGet> SubmitAsyncMemoryBatchGet(
+        std::shared_ptr<Client> owner,
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<Slice>>& destinations);
 
     /**
      * @brief Batch retrieve data for multiple keys
