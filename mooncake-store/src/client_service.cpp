@@ -1377,9 +1377,10 @@ AsyncMemoryBatchGet::AsyncMemoryBatchGet(std::shared_ptr<Client> owner,
     : owner_(std::move(owner)), pending_(true), key_count_(key_count) {}
 
 AsyncMemoryBatchGet::~AsyncMemoryBatchGet() {
-    // The manager retains an admitted handle through completion. Its final
-    // reference is released after the backend stops accessing destinations.
-    (void)wait();
+    // Backend futures must drain before their state and Client are freed.
+    // A pending handle owns no DMA itself; the manager retains a reference
+    // until it has completed every accepted operation.
+    if (!pending_) (void)wait();
 }
 
 bool AsyncMemoryBatchGet::ready() {
@@ -1543,8 +1544,15 @@ std::shared_ptr<AsyncMemoryBatchGet> AsyncMemoryGetManager::Submit(
     }
     auto operation =
         std::make_shared<AsyncMemoryBatchGet>(owner_, keys.size());
-    queue_.push_back({operation, keys, destinations});
+    // Reserve the tracking slot first. A failed queue allocation must not
+    // leave a pending operation without a manager to complete it.
     active_.push_back({operation, nullptr, std::move(ranges), bytes});
+    try {
+        queue_.push_back({operation, keys, destinations});
+    } catch (...) {
+        active_.pop_back();
+        throw;
+    }
     used_bytes_ += bytes;
     lock.unlock();
     cv_.notify_all();
