@@ -2,67 +2,97 @@
 orphan: true
 ---
 
-# Async memory-only batch get (RFC #5668): implementation slice
+# RFC #5668 — bounded asynchronous memory batch read
 
-This is an **experimental, incomplete** first slice of
-[Issue #5668](https://github.com/kvcache-ai/Mooncake/issues/5668).
-It is not yet ready for production or merge.
+This branch implements a **CPU-verifiable first implementation** for
+[Mooncake issue #5668](https://github.com/kvcache-ai/Mooncake/issues/5668).
+It is an experimental implementation pending integration and RDMA verification.
+It does not implement the downstream CUDA / Ascend graph barriers.
 
-## API implemented in this branch
+## Python API
 
 ```python
-op = store.batch_get_into_multi_buffers_async(
-    ["key-a", "key-b"],
-    [[ptr_a0, ptr_a1], [ptr_b]],
-    [[size_a0, size_a1], [size_b]],
-)
-if op.poll() is None:
-    # Submit another independent layer while this one is in flight.
-    pass
-result = op.wait()  # One byte count or negative error per key.
+op0 = store.batch_get_into_multi_buffers_async(
+    ["layer0-key"], [[registered_ptr0]], [[byte_count0]])
+op1 = store.batch_get_into_multi_buffers_async(
+    ["layer1-key"], [[registered_ptr1]], [[byte_count1]])
+
+assert op0.poll() is None  # if not yet finished
+values0 = op0.wait(timeout_ms=1000)  # raises TimeoutError if not yet complete
+values1 = op1.wait()  # per-key byte counts or negative error codes
 ```
 
-The C++ Store submits its memory-replica transfers through the existing
-`TransferSubmitter` rather than dispatching the blocking BatchGet in
-an executor. The handle keeps the underlying C++ Store Client alive until
-its transfers are drained and checked. Its destructor calls `wait()`.
+A timeout only stops the caller's wait. It **does not** cancel I/O; destinations
+must remain alive and registered through terminal completion. The next
+`poll()`/`wait()` may still report success or failure.
 
-## Deliberately restricted initial scope
+## Pipeline and admission
 
-* RealClient only; `DummyClient` is not supported.
-* RDMA protocol and MEMORY replicas only. No SSD, DFS, NoF, GPU IPC,
-  hybrid transport, or TENT-specific claims.
-* Every destination slice must be registered, writable, and within a
-  single registered region. The caller must keep allocations registered
-  and alive until terminal completion.
-* Duplicate keys are rejected; they cannot safely be represented by the
-  existing key-indexed batch map without explicit duplicate handling.
-* Admission currently happens after metadata lookup and transport submit,
-  not in a separate bounded dispatcher.
-* No global in-flight operation/byte credits, timeout-taking wait,
-  wait-any completion queue, drain-on-explicit-close coordination, or
-  connector/graph barrier yet. These are required before removing the
-  draft status.
+1. `RealClient` checks that every provided slice lies in a writable
+   registered region. Only the `rdma` protocol is supported.
+2. `AsyncMemoryGetManager::Submit()` validates the key-major descriptors,
+   duplicate keys, integer bounds, overlapping destination ranges, and
+   both in-flight budgets. It reserves credits before accepting a request.
+3. The **single submission thread** resolves replica metadata, validates
+   memory routing/size/lease and submits native TransferFuture operations.
+   Preflight happens before any transfer for that operation.
+4. The **single completion thread** polls in-flight native futures and
+   independently validates transfer results, checksums and leases before
+   publishing the operation's immutable per-key result.
+5. Credits and destination reservations are released only after the
+   completion path drains backend accesses.
 
-## Review and validation checklist
+Default per-RealClient budgets in this implementation are 16 admitted reads
+and 256 MiB of cumulative admitted destination bytes. Both queued and
+submitted requests count. Full admission fails immediately without writing
+destination memory.
 
-- [ ] Compile Store, integration bindings, and `async_memory_batch_get_test`
-- [ ] Verify registered-buffer direct RDMA path on real hardware
-- [ ] Deterministically block first completion; prove second layer is
-      submitted before first completion
-- [ ] Compare bytes against synchronous `batch_get_into_multi_buffers`,
-      including discontiguous slices and key order
-- [ ] Validate failures, checksum, lease expiry, zero/invalid pointers,
-      mixed MEMORY/DISK routing, timeout and partial DMA drain
-- [ ] Verify dropping handle and shutting down the Python client while
-      reads are in flight; prohibit memory unregister until DMA is drained
-- [ ] Implement bounded per-client operation and byte admission, including
-      rejection with no submitted writes and subsequent credit release
-- [ ] Implement wait timeout and terminal-state guarantees
-- [ ] Compare against bounded concurrent blocking reads, not only serial
-      synchronous calls; measure P50/P99, CPU and device gaps
+The first implementation deliberately rejects overlapping destinations,
+duplicate keys, unsupported source replica types (including SSD/DFS/NoF)
+and non-RDMA protocols rather than silently using a staged path.
 
-See upstream's earlier closed prototype
-[#1861](https://github.com/kvcache-ai/Mooncake/pull/1861) for previous
-two-phase work. This version deliberately avoids copying that patch,
-which predates the current Store lifecycle and duplicate-fanout changes.
+## Lifecycle contract
+
+The manager retains every accepted handle, even if Python drops its reference.
+`RealClient.unregister_buffer()` blocks new admissions, drains outstanding
+operations, then deregisters a buffer. `RealClient.tearDownAll_internal()`
+closes admission and joins both manager threads before destroying the
+underlying Client/TransferEngine.
+
+Caller-owned memory is borrowed, not reference-counted by the C++ API:
+do not free/remap a destination without first completing the operation
+or deregistering through the Store API. Arbitrary external memory free
+cannot be intercepted.
+
+## CPU regression verification
+
+The GTest `async_memory_batch_get_test` uses an injected deterministic
+completion backend and checks:
+
+- L1 reaches the submission worker while L0 is still pending.
+- L1 completes first; per-operation results remain independent.
+- Timeouts do not cancel or prematurely publish readiness.
+- Rejected operation/byte credits never invoke the backend.
+- Duplicate keys, overlapping buffers and invalid/zero slices fail before
+  dispatch. Destination reservations release on completion.
+- Shutdown rejects admissions and drains accepted operations before return.
+
+These tests validate the **control-plane state machine** only. They do
+not prove RDMA completion, direct placement, checksum data correctness,
+or failover behavior without a data-plane integration setup.
+
+## Outstanding validation before proposing upstream
+
+- [ ] Re-run native C++ target build and the focused GTest on the latest SHA.
+- [ ] Re-run C++ format, Sphinx and DCO checks on the squashed commit.
+- [ ] Test actual registered RDMA memory with discontiguous destinations.
+- [ ] Verify transfer failures, checksum failures, partial writes and lease
+      expiry against real `TransferFuture` completion.
+- [ ] Compare against bounded concurrent blocking reads on the same hardware,
+      measure backend acceptance overlap, CPU overhead and idle transfer gaps.
+- [ ] Validate consumer stream/event barriers for GPU or Ascend integrations.
+
+The earlier two-phase prototype
+[#1861](https://github.com/kvcache-ai/Mooncake/pull/1861)
+informed the interface design, but this implementation keeps both metadata
+and transfer progress inside the Store-owned bounded dispatcher.
