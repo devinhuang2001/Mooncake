@@ -2245,12 +2245,38 @@ PYBIND11_MODULE(_store, m) {
              "True when all submissions have reached terminal status.")
         .def(
             "wait",
-            [](AsyncMemoryBatchGet &op) {
-                py::gil_scoped_release release;
-                return op.wait();
+            [](AsyncMemoryBatchGet &op,
+               const std::optional<uint64_t> &timeout_ms) -> py::object {
+                if (!timeout_ms) {
+                    std::vector<int64_t> result;
+                    {
+                        py::gil_scoped_release release;
+                        result = op.wait();
+                    }
+                    return py::cast(result);
+                }
+                if (*timeout_ms >
+                    static_cast<uint64_t>(
+                        std::chrono::milliseconds::max().count())) {
+                    throw py::value_error("timeout_ms is too large");
+                }
+                std::optional<std::vector<int64_t>> result;
+                {
+                    py::gil_scoped_release release;
+                    result = op.wait_for(
+                        std::chrono::milliseconds(*timeout_ms));
+                }
+                if (!result) {
+                    PyErr_SetString(PyExc_TimeoutError,
+                                    "async batch get wait timed out; "
+                                    "operation remains in flight");
+                    throw py::error_already_set();
+                }
+                return py::cast(*result);
             },
-            "Wait for transfer drain; returns per-key bytes or negative "
-            "errors.")
+            py::arg("timeout_ms") = py::none(),
+            "Wait until DMA is drained; timeout raises TimeoutError but "
+            "does not cancel the operation.")
         .def(
             "poll",
             [](AsyncMemoryBatchGet &op) -> py::object {
