@@ -8681,6 +8681,42 @@ RealClient::batch_put_from_multi_buffers_internal(
                                       stage_nonlocal, &Client::BatchPut);
 }
 
+std::shared_ptr<AsyncMemoryBatchGet> RealClient::submit_async_memory_batch_get(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes) {
+    if (!client_ || client_->GetProtocol() != "rdma" ||
+        keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
+        throw std::invalid_argument(
+            "asynchronous batch-get requires an initialized RDMA Store");
+    }
+    std::vector<std::vector<Slice>> destinations;
+    destinations.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (all_buffers[i].size() != all_sizes[i].size() ||
+            all_buffers[i].empty()) {
+            throw std::invalid_argument("invalid destination slice shape");
+        }
+        std::vector<Slice> slices;
+        slices.reserve(all_buffers[i].size());
+        for (size_t j = 0; j < all_buffers[i].size(); ++j) {
+            const auto region =
+                resolve_writable_buffer_region(all_buffers[i][j]);
+            if (!region || all_sizes[i][j] == 0 ||
+                region->offset > region->size ||
+                all_sizes[i][j] > region->size - region->offset) {
+                throw std::invalid_argument(
+                    "async get requires a registered writable buffer");
+            }
+            slices.emplace_back(
+                Slice{all_buffers[i][j], all_sizes[i][j]});
+        }
+        destinations.emplace_back(std::move(slices));
+    }
+    return client_->SubmitAsyncMemoryBatchGet(
+        client_, keys, destinations);
+}
+
 std::vector<int> RealClient::batch_get_into_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
