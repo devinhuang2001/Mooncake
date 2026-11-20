@@ -33,3 +33,5 @@ jobs:
           git commit -s -m "feat(store): implement bounded native async batch get (RFC #5668)"
           git push --force-with-lease="refs/heads/work/async-store-batch-get-rfc5668:${original}" \
             origin HEAD:refs/heads/work/async-store-batch-get-rfc5668
+
+# Final RFC 5668 draft consolidation trigger.
