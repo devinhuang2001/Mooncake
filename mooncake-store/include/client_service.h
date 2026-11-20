@@ -90,7 +90,8 @@ class AsyncMemoryBatchGet {
         int64_t result = static_cast<int64_t>(ErrorCode::INVALID_PARAMS);
     };
 
-    AsyncMemoryBatchGet(std::shared_ptr<Client> owner, std::vector<Entry> entries);
+    AsyncMemoryBatchGet(std::shared_ptr<Client> owner,
+                        std::vector<Entry> entries);
     ~AsyncMemoryBatchGet();
 
     AsyncMemoryBatchGet(const AsyncMemoryBatchGet&) = delete;
@@ -197,8 +198,7 @@ class Client {
     // return; completion does not. The returned operation holds Client alive.
     // Unsupported replica paths fail before any transfer is submitted.
     std::shared_ptr<AsyncMemoryBatchGet> SubmitAsyncMemoryBatchGet(
-        std::shared_ptr<Client> owner,
-        const std::vector<std::string>& keys,
+        std::shared_ptr<Client> owner, const std::vector<std::string>& keys,
         const std::vector<std::vector<Slice>>& destinations);
 
     /**
