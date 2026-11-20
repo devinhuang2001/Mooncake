@@ -117,6 +117,7 @@ class AsyncMemoryBatchGet {
    private:
     friend class AsyncMemoryGetManager;
     friend class AsyncMemoryBatchGetTestPeer;
+    friend class Client;
     void Complete(std::vector<int64_t> results);
 
     std::shared_ptr<Client> owner_;
